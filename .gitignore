@@ -1,0 +1,19 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment configuration configurations
+.env
+.venv/
+venv/
+ENV/
+
+# Security Analysis Pipeline state tracking ledgers
+reports/
+samples/
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
