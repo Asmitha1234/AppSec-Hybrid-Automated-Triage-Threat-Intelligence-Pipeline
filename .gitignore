@@ -1,19 +1,24 @@
-# Python build artifacts
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# ====================================================================
+# 🛡️ EXCLUSIVE ALLOW-LIST CONFIGURATION (CORE ENGINE ONLY)
+# ====================================================================
 
-# Environment configuration configurations
-.env
-.venv/
-venv/
-ENV/
+# 1. Ignore absolutely everything across all directories by default
+*
+*/*
+**/
 
-# Security Analysis Pipeline state tracking ledgers
-reports/
-samples/
+# 2. Explicitly whitelist only your exact main engine scripts
+!/generate_dashboard.py
+!/run_pipeline.py
+!/scanner.py
+!/README.md
+!/app_ui.py
+!/auto_patch.py
+!/checkov_scanner.py
+!/.gitignore
 
-# Operating system metadata
-.DS_Store
-Thumbs.db
+# 3. Explicitly whitelist the inner scanner logic directory
+!/scanner/
+!/scanner/__init__.py
+!/scanner/ai_triage_github.py
+!/scanner/rules.py

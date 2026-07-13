@@ -2,9 +2,9 @@ import os
 import sys
 import subprocess
 
-SCAN_TARGET = "./src/pygoat_master"
+SCAN_TARGET = "./samples"
 REPORTS_DIR = "reports"
-FINAL_AI_REPORT = os.path.join(REPORTS_DIR, "ai_verified_report_pygoat_2.0.json")
+FINAL_AI_REPORT = os.path.join(REPORTS_DIR, "ai_verified_report_sample.json")
 
 def run_command(command, description):
     print(f"\n[*] Starting Phase: {description}...")
@@ -22,18 +22,24 @@ def run_command(command, description):
         print(f"[-] Command failed: Execution target missing or not installed.", file=sys.stderr)
         return None
 
+# Updated segment in run_pipeline.py
 def main():
     print("="*70)
-    print("      APPSEC HYBRID AUTOMATED TRIAGE & THREAT INTEL PIPELINE")
+    print("      APPSEC & IAC HYBRID AUTOMATED TRIAGE PIPELINE")
     print("="*70)
     
     os.makedirs(REPORTS_DIR, exist_ok=True)
     os.makedirs(SCAN_TARGET, exist_ok=True)
 
-    # FIX: Pointed directly to your custom local scanner.py script rather than unconfigured bandit
+    # 1. Run Application Code Vulnerability Analysis
     sast_command = [sys.executable, "scanner.py", SCAN_TARGET]
     run_command(sast_command, "Source Workspace Code Scan (SAST)")
 
+    # 2. Run Infrastructure Code Vulnerability Analysis (NEW)
+    iac_command = [sys.executable, "checkov_scanner.py", SCAN_TARGET]
+    run_command(iac_command, "Cloud Infrastructure Target Manifest Scan (IaC Security)")
+
+    # 3. Process All Collected Findings using AI Triage
     triage_command = [sys.executable, "scanner/ai_triage_github.py"]
     run_command(triage_command, "AI Filtering, Context Analysis & Threat Intelligence Verification")
 

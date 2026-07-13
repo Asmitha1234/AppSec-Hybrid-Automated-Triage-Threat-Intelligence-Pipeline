@@ -1,193 +1,264 @@
-import os
+# generate_dashboard.py
 import json
-import http.server
-import socketserver
+import os
+import sys
 import webbrowser
+from http.server import SimpleHTTPRequestHandler
+from socketserver import TCPServer
+import threading
 
-PORT = 8085
-REPORT_PATH = "reports/ai_verified_report_pygoat_2.0.json" # Match ledger name shared by tracker paths
+REPORT_PATH = "reports/ai_verified_report_sample.json" # Updated default fallback target path string
+REPORTS_DIR = "reports"
+DASHBOARD_FILE = "dashboard.html"
+DASHBOARD_PATH = os.path.join(REPORTS_DIR, DASHBOARD_FILE)
 
-def html_escape(text):
-    if not isinstance(text, str):
-        text = str(text)
-    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#x27;')
+# Weights to enable strict sorting by risk criticality
+SEVERITY_WEIGHTS = {
+    "CRITICAL": 4,
+    "HIGH": 3,
+    "MEDIUM": 2,
+    "LOW": 1
+}
 
-def generate_html():
+def get_normalized_severity(issue):
+    """Safely extracts severity prioritizing AI-verified fields, fallback to local scanner fields."""
+    sev = issue.get("real_cvss_severity") or issue.get("severity") or "MEDIUM"
+    return str(sev).upper()
+
+def generate_ui():
     if not os.path.exists(REPORT_PATH):
-        return """
-        <html><body style='font-family:sans-serif; text-align:center; padding-top:100px; color:#e53e3e;'>
-        <h2>[-] Error: Data Triage Ledger File Not Found</h2>
-        <p>Please execute 'python run_pipeline.py' to generate the security baseline visualization tables.</p>
-        </body></html>
-        """
+        print(f"[-] Ledger source path {REPORT_PATH} missing. Run pipeline first.")
+        return False
+
+    with open(REPORT_PATH, "r", encoding="utf-8") as f:
+        findings = json.load(f)
+
+    # 1. Calculate Origin Metrics
+    appsec_count = sum(1 for item in findings if item.get("origin") == "appsec")
+    iac_count = sum(1 for item in findings if item.get("origin") == "iac")
+
+    # 2. Calculate Severity and Validity Metrics
+    total_count = len(findings)
+    critical_count = sum(1 for item in findings if get_normalized_severity(item) == "CRITICAL" and item.get("is_true_positive") != False)
+    high_count = sum(1 for item in findings if get_normalized_severity(item) == "HIGH" and item.get("is_true_positive") != False)
+    medium_count = sum(1 for item in findings if get_normalized_severity(item) == "MEDIUM" and item.get("is_true_positive") != False)
+    low_count = sum(1 for item in findings if get_normalized_severity(item) == "LOW" and item.get("is_true_positive") != False)
+    fp_count = sum(1 for item in findings if item.get("is_true_positive") == False)
     
-    try:
-        with open(REPORT_PATH, "r", encoding="utf-8") as f:
-            findings = json.load(f)
-    except Exception as e:
-        return f"<html><body><h2>[-] Error loading JSON: {html_escape(str(e))}</h2></body></html>"
+    # 3. Sort Findings by Criticality Priority (False Positives pushed to the bottom)
+    def get_sort_key(x):
+        if x.get("is_true_positive") == False:
+            return -1
+        return SEVERITY_WEIGHTS.get(get_normalized_severity(x), 0)
 
-    def is_true(val, default=True):
-        if val is None:
-            return default
-        if isinstance(val, bool):
-            return val
-        return str(val).strip().lower() in ("true", "1", "yes")
+    sorted_findings = sorted(findings, key=get_sort_key, reverse=True)
 
-    total_alerts = len(findings)
-    critical_count = sum(1 for x in findings if isinstance(x, dict) and str(x.get("real_cvss_severity", "")).upper() == "CRITICAL" and is_true(x.get("is_true_positive", True)))
-    high_count = sum(1 for x in findings if isinstance(x, dict) and str(x.get("real_cvss_severity", "")).upper() == "HIGH" and is_true(x.get("is_true_positive", True)))
-    medium_count = sum(1 for x in findings if isinstance(x, dict) and str(x.get("real_cvss_severity", "")).upper() == "MEDIUM" and is_true(x.get("is_true_positive", True)))
-    low_count = sum(1 for x in findings if isinstance(x, dict) and str(x.get("real_cvss_severity", "")).upper() == "LOW" and is_true(x.get("is_true_positive", True)))
-    fp_count = sum(1 for x in findings if isinstance(x, dict) and not is_true(x.get("is_true_positive", True)))
-
+    # Generate Dynamic Table Rows
     table_rows = ""
-    for idx, item in enumerate(findings, 1):
-        if not isinstance(item, dict):
-            continue
-        is_tp = is_true(item.get("is_true_positive", True))
-        cve_tag = item.get("cve_id", "N/A")
+    for issue in sorted_findings:
+        is_fp = issue.get("is_true_positive") == False
+        sev = get_normalized_severity(issue)
         
-        if not is_tp:
-            cve_style = "background-color: #edf2f7; color: #718096; border: 1px solid #cbd5e0;"
-            severity = "FALSE POSITIVE"
-            sev_class = "badge-fp"
-            score_string = "0.0"
-        elif "MOCK" in str(cve_tag).upper() or cve_tag == "N/A":
-            cve_style = "background-color: #ebf8ff; color: #2b6cb0; border: 1px solid #bee3f8; font-style: italic;"
-            severity = str(item.get("real_cvss_severity", "Medium")).upper()
-            sev_class = f"badge-{severity.lower()}"
-            score_string = str(item.get("real_cvss_score", 0.0))
+        if is_fp:
+            sev_badge = '<span class="badge badge-fp">FALSE POSITIVE</span>'
         else:
-            cve_style = "background-color: #feebc8; color: #c05621; border: 1px solid #fbd38d; font-weight: bold;"
-            severity = str(item.get("real_cvss_severity", "Medium")).upper()
-            sev_class = f"badge-{severity.lower()}"
-            score_string = str(item.get("real_cvss_score", 0.0))
+            sev_badge = f'<span class="badge badge-{sev.lower()}">{sev}</span>'
             
-        file_short = os.path.basename(item.get("file_name", "unknown")) + f" (Line {item.get('line_number', 0)})"
-        explanation = item.get("ai_taint_explanation", "No explanation compiled.")
-        patch = item.get("remediation_patch", "# No patch available.")
+        origin_label = "Application Security" if issue.get("origin") == "appsec" else "Cloud Infrastructure (IaC)"
+        origin_class = "badge-appsec" if issue.get("origin") == "appsec" else "badge-iac"
+        
+        # Pull threat intelligence identifiers (CVE / CIS / CWE)
+        vuln_id = issue.get("cve_id")
+        id_badge = f'<span class="cve-tag">{vuln_id}</span>' if vuln_id else ''
+        
+        # Pull dynamic remediation fix or AI verification patch
+        reremediation_text = issue.get("reremediation_patch") or issue.get("remediation_patch") or issue.get("recommended_fix") or "No patch code supplied."
+        
+        # Escape any raw script brackets inside the code snippet window to prevent browser parsing errors
+        suspicious_raw = str(issue.get('suspicious_code', '')).replace('<', '&lt;').replace('>', '&gt;')
+        remediation_clean = str(reremediation_text).replace('<', '&lt;').replace('>', '&gt;')
+
+        # Using python's 'or' evaluation bypasses empty strings or missing keys seamlessly
+        vulnerability_narrative = issue.get('ai_taint_explanation') or issue.get('explanation') or 'No diagnostic tracking details available.'
+
+        # 🟢 PHASE 2 REMEDIATION LOG TRACKER LOOKUPS
+        rem_status = issue.get("remediation_status")
+        ver_notes = issue.get("verification_notes")
+        
+        remediation_html_block = ""
+        if rem_status:
+            # Assign dynamic color states to the UI cards depending on compilation/audit results
+            if rem_status == "REMEDIATED_AND_VERIFIED":
+                status_class = "patch-status-success"
+                status_label = "🟢 Remediation Verified Safe"
+            elif rem_status == "REMEDIATION_FAILED_AI_REJECTION":
+                status_class = "patch-status-fail"
+                status_label = "❌ Fix Rejected By AI (Rolled Back)"
+            elif rem_status == "REMEDIATION_FAILED_SYNTAX_ERROR":
+                status_class = "patch-status-warn"
+                status_label = "⚠️ Syntax Compilation Failed (Rolled Back)"
+            else:
+                status_class = "patch-status-pending"
+                status_label = "⏳ Remediation Pending"
+                
+            remediation_html_block = f"""
+            <div class="patch-status-card {status_class}">
+                <div class="patch-status-header">{status_label}</div>
+                <div class="patch-status-notes">"{ver_notes if ver_notes else 'No verification summary log submitted.'}"</div>
+            </div>
+            """
 
         table_rows += f"""
-        <tr class="{'row-fp' if not is_tp else ''}">
-            <td>{idx}</td>
+        <tr class="{"row-fp" if is_fp else ""}">
+            <td>{sev_badge}</td>
+            <td><span class="badge {origin_class}">{origin_label}</span></td>
             <td>
-                <span class="cve-badge" style="{cve_style}">{html_escape(cve_tag)}</span>
-                <strong style="display: block; margin-top: 8px; font-size: 14px; color: #1a202c;">
-                    {html_escape(item.get("vulnerability_type", "Unknown Indicator"))}
-                </strong>
-                {'' if is_tp else '<span class="dismissed-tag">[DISMISSED]</span>'}
+                <strong>{issue.get('vulnerability_type')}</strong> {id_badge}
+                <div style="margin-top: 5px; font-size: 12px; color: #64748b; line-height: 1.5;">
+                    {vulnerability_narrative}
+                </div>
+                {remediation_html_block}
             </td>
-            <td><span class="badge {sev_class}">{severity} ({score_string})</span></td>
-            <td><span class="file-path" title="{html_escape(item.get('file_name', ''))}">{file_short}</span></td>
+            <td><code>{os.path.basename(str(issue.get('file_name')))}:line {issue.get('line_number')}</code></td>
             <td>
-                <div class="desc-text"><strong>Risk Analysis:</strong> {html_escape(explanation)}</div>
-                {"" if not is_tp else f'''
-                <div class="patch-header">Suggested Remediation Patch:</div>
-                <pre class="code-block"><code>{html_escape(patch)}</code></pre>
-                '''}
+                <div class="snippet-title">Flagged Snippet:</div>
+                <pre class="code-box"><code>{suspicious_raw}</code></pre>
+                
+                <div class="patch-title">Suggested Remediation Patch:</div>
+                <pre class="patch-box"><code>{remediation_clean}</code></pre>
             </td>
         </tr>
         """
 
-    html_template = f"""<!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>AppSec Vulnerability Assessment Dashboard</title>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f7fafc; color: #2d3748; margin: 0; padding: 20px; }}
-            .container {{ max-width: 1400px; margin: 0 auto; }}
-            .header {{ background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 30px; border-radius: 8px; margin-bottom: 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            .header h1 {{ margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.5px; }}
-            .header p {{ margin: 8px 0 0 0; color: #a0aec0; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }}
-            .metrics-bar {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px; margin-bottom: 25px; }}
-            .metric-card {{ background-color: white; border: 1px solid #e2e8f0; padding: 20px; text-align: center; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }}
-            .metric-card .num {{ font-size: 32px; font-weight: bold; color: #2b6cb0; }}
-            .metric-card .num.crit {{ color: #e53e3e; }}
-            .metric-card .num.high {{ color: #dd6b20; }}
-            .metric-card .num.med {{ color: #b7791f; }}
-            .metric-card .num.fp {{ color: #718096; }}
-            .metric-card .lbl {{ font-size: 11px; text-transform: uppercase; color: #718096; font-weight: 600; margin-top: 5px; }}
-            table {{ width: 100%; border-collapse: separate; border-spacing: 0; background-color: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); border: 1px solid #e2e8f0; overflow: hidden; }}
-            th {{ background-color: #edf2f7; padding: 15px; font-weight: 600; text-align: left; border-bottom: 2px solid #cbd5e0; font-size: 13px; color: #4a5568; }}
-            td {{ padding: 15px; border-bottom: 1px solid #e2e8f0; vertical-align: top; font-size: 14px; }}
-            tr:last-child td {{ border-bottom: none; }}
-            tr:hover {{ background-color: #f8fafc; }}
-            .row-fp {{ background-color: #fcfcfc; opacity: 0.85; }}
-            .cve-badge {{ display: inline-block; font-family: 'Consolas', monospace; font-size: 11px; padding: 3px 7px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px; }}
-            .dismissed-tag {{ display: inline-block; margin-top: 4px; font-size: 10px; color: #e53e3e; font-weight: bold; letter-spacing: 0.5px; }}
-            .badge {{ display: inline-block; padding: 4px 8px; font-size: 11px; font-weight: bold; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px; }}
-            .badge-critical {{ background-color: #fff5f5; color: #c53030; border: 1px solid #feb2b2; }}
-            .badge-high {{ background-color: #fffaf0; color: #dd6b20; border: 1px solid #fbd38d; }}
-            .badge-medium {{ background-color: #fffbeb; color: #b7791f; border: 1px solid #fef3c7; }}
-            .badge-low {{ background-color: #f7fafc; color: #4a5568; border: 1px solid #e2e8f0; }}
-            .badge-fp {{ background-color: #edf2f7; color: #4a5568; border: 1px solid #cbd5e0; }}
-            .code-block {{ font-family: 'Consolas', 'Courier New', monospace; background-color: #1a202c; color: #f7fafc; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; font-size: 12.5px; margin: 8px 0 0 0; line-height: 1.5; box-shadow: inset 0 2px 4px rgba(0,0,0,0.1); }}
-            .file-path {{ font-family: 'Consolas', monospace; color: #4a5568; background-color: #edf2f7; padding: 3px 6px; border-radius: 4px; font-size: 12px; font-weight: 500; }}
-            .desc-text {{ line-height: 1.6; color: #4a5568; font-size: 13.5px; }}
-            .patch-header {{ font-size: 11px; font-weight: bold; text-transform: uppercase; color: #319795; margin-top: 12px; letter-spacing: 0.5px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>AppSec Vulnerability Assessment Dashboard</h1>
-                <p>Phase 2 Hybrid Automated Triage & Threat Intelligence Registry Logs</p>
-            </div>
-            <div class="metrics-bar">
-                <div class="metric-card"><div class="num">{total_alerts}</div><div class="lbl">Total Indicators</div></div>
-                <div class="metric-card"><div class="num crit">{critical_count}</div><div class="lbl">Critical Risks</div></div>
-                <div class="metric-card"><div class="num high">{high_count}</div><div class="lbl">High Risks</div></div>
-                <div class="metric-card"><div class="num med">{medium_count + low_count}</div><div class="lbl">Medium / Low</div></div>
-                <div class="metric-card"><div class="num fp">{fp_count}</div><div class="lbl">False Positives</div></div>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 3%;">#</th>
-                        <th style="width: 22%;">Vulnerability & Threat Identifier</th>
-                        <th style="width: 15%;">CVSS Severity</th>
-                        <th style="width: 20%;">Target Workspace File Location</th>
-                        <th style="width: 40%;">Remediation Matrix Triage Analysis & Fix Script</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {table_rows}
-                </tbody>
-            </table>
+    # HTML Layout Structural Template
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AppSec & IaC Security Ledger Dashboard</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f6f9; margin: 0; padding: 30px; color: #333; }}
+        .header {{ text-align: center; margin-bottom: 30px; }}
+        .origin-container {{ display: flex; gap: 20px; margin-bottom: 25px; justify-content: center; }}
+        .origin-card {{ background: #fff; border-radius: 8px; padding: 20px; width: 45%; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-top: 5px solid #4a90e2; }}
+        .origin-card.iac {{ border-top-color: #f5a623; }}
+        .origin-card h3 {{ margin: 0 0 10px 0; color: #666; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }}
+        .origin-card .count {{ font-size: 32px; font-weight: bold; color: #222; }}
+        .summary-strip {{ display: flex; background: #1e293b; color: #fff; padding: 15px; border-radius: 8px; justify-content: space-around; margin-bottom: 30px; font-weight: bold; text-align: center; }}
+        .summary-strip div {{ flex: 1; border-right: 1px solid #334155; }}
+        .summary-strip div:last-child {{ border-right: none; }}
+        .summary-strip span {{ display: block; font-size: 20px; margin-top: 5px; }}
+        
+        table {{ width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+        th, td {{ padding: 15px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }}
+        th {{ background: #f8fafc; color: #475569; text-transform: uppercase; font-size: 12px; letter-spacing: 0.5px; }}
+        
+        .badge {{ padding: 6px 12px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; display: inline-block; }}
+        .badge-critical {{ background: #f87171; color: #7f1d1d; }}
+        .badge-high {{ background: #fb923c; color: #7c2d12; }}
+        .badge-medium {{ background: #facc15; color: #713f12; }}
+        .badge-low {{ background: #94a3b8; color: #1e293b; }}
+        .badge-fp {{ background: #e2e8f0; color: #475569; border: 1px dashed #cbd5e1; }}
+        .badge-appsec {{ background: #e0f2fe; color: #0369a1; }}
+        .badge-iac {{ background: #fef3c7; color: #b45309; }}
+        
+        .cve-tag {{ background: #6366f1; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 5px; }}
+        .row-fp {{ background-color: #f8fafc; opacity: 0.70; }}
+        
+        /* Code Box and Remediation Patch Styling */
+        .snippet-title, .patch-title {{ font-size: 11px; font-weight: bold; text-transform: uppercase; color: #64748b; margin-bottom: 4px; }}
+        .patch-title {{ color: #10b981; margin-top: 10px; }}
+        .code-box, .patch-box {{ margin: 0; padding: 10px; border-radius: 6px; font-family: Courier, monospace; font-size: 12px; overflow-x: auto; max-width: 500px; }}
+        .code-box {{ background: #f1f5f9; color: #db2777; border-left: 4px solid #cbd5e1; }}
+        .patch-box {{ background: #ecfdf5; color: #065f46; border-left: 4px solid #34d399; white-space: pre-wrap; }}
+        
+        /* 🟢 AUTOMATED REMEDIATION BADGE STYLING CLASSES */
+        .patch-status-card {{ margin-top: 12px; padding: 12px; border-radius: 6px; border: 1px solid transparent; font-size: 12px; }}
+        .patch-status-header {{ font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; font-size: 11px; margin-bottom: 4px; }}
+        .patch-status-notes {{ font-style: italic; line-height: 1.4; }}
+        
+        .patch-status-success {{ background: #f0fdf4; border-color: #bbf7d0; color: #166534; }}
+        .patch-status-fail {{ background: #fef2f2; border-color: #fca5a5; color: #991b1b; }}
+        .patch-status-warn {{ background: #fffbeb; border-color: #fde68a; color: #92400e; }}
+        .patch-status-pending {{ background: #f8fafc; border-color: #e2e8f0; color: #475569; }}
+
+        code {{ font-family: Consolas, Monaco, monospace; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>AppSec & IaC Automated Security Registry</h2>
+        <p>Phase 2 Hybrid Scanning Diagnostics Summary Ledger</p>
+    </div>
+    <div class="origin-container">
+        <div class="origin-card">
+            <h3>Application Security Vulnerabilities</h3>
+            <div class="count">{appsec_count}</div>
         </div>
-    </body>
-    </html>
-    """
-    return html_template
+        <div class="origin-card iac">
+            <h3>Infrastructure as Code (IaC) Flaws</h3>
+            <div class="count">{iac_count}</div>
+        </div>
+    </div>
+    <div class="summary-strip">
+        <div>Total Findings <span>{total_count}</span></div>
+        <div style="color: #f87171;">Critical <span>{critical_count}</span></div>
+        <div style="color: #fb923c;">High <span>{high_count}</span></div>
+        <div style="color: #facc15;">Medium <span>{medium_count}</span></div>
+        <div style="color: #cbd5e1;">Low <span>{low_count}</span></div>
+        <div style="color: #94a3b8;">False Positives <span>{fp_count}</span></div>
+    </div>
+    <h3>Prioritized Risk Registry</h3>
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 10%;">Severity</th>
+                <th style="width: 15%;">Origin Domain</th>
+                <th style="width: 25%;">Vulnerability Details</th>
+                <th style="width: 15%;">Location Context</th>
+                <th style="width: 35%;">Code Context & Remediation Patch</th>
+            </tr>
+        </thead>
+        <tbody>
+            {table_rows}
+        </tbody>
+    </table>
+</body>
+</html>
+"""
 
-class DashboardRequestHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-type", "text/html; charset=utf-8")
-            self.end_headers()
-            response_content = generate_html()
-            self.wfile.write(response_content.encode("utf-8"))
-        else:
-            super().do_GET()
-
-def run_dashboard_server():
-    os.makedirs("reports", exist_ok=True)
-    handler = DashboardRequestHandler
-    socketserver.TCPServer.allow_reuse_address = True
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    with open(DASHBOARD_PATH, "w", encoding="utf-8") as df:
+        df.write(html_content)
     
-    print(f"[*] Initializing local presentation layer socket server on port {PORT}...")
+    with open(os.path.join(REPORTS_DIR, "index.html"), "w", encoding="utf-8") as index_f:
+        index_f.write(html_content)
+        
+    print(f"[SUCCESS] Dashboard interface successfully updated with Remediation Columns.")
+    return True
+
+def serve_localhost(port=8085):
+    os.chdir(os.path.abspath(REPORTS_DIR))
+    
+    class CustomHandler(SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass 
+
     try:
-        with socketserver.TCPServer(("", PORT), handler) as httpd:
-            dashboard_url = f"http://localhost:{PORT}"
-            print(f"[SUCCESS] Dashboard actively hosted at location: {dashboard_url}")
-            print("[*] Press CTRL + C inside this console window to terminate the server.")
-            webbrowser.open(dashboard_url)
+        TCPServer.allow_reuse_address = True
+        with TCPServer(("", port), CustomHandler) as httpd:
+            localhost_url = f"http://localhost:{port}/"
+            print(f"[*] Localhost Live Dashboard Server established at: {localhost_url}")
+            print("[*] Press Ctrl+C inside the terminal process sequence to spin down.")
+            
+            threading.Thread(target=lambda: webbrowser.open(localhost_url)).start()
             httpd.serve_forever()
     except Exception as e:
-        print(f"[-] Execution Server Halt Encountered: {str(e)}")
+        print(f"[-] Localhost server initialization exception: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
-    run_dashboard_server()
+    if len(sys.argv) > 1:
+        REPORT_PATH = sys.argv[1]
+        
+    print(f"[*] Compiling HTML dashboard using database target: {REPORT_PATH}")
+    generate_ui()

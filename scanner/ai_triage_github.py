@@ -1,3 +1,4 @@
+# scanner/ai_triage_github.py
 import os
 import json
 import time
@@ -5,15 +6,9 @@ import sys
 from azure.ai.inference import ChatCompletionsClient
 from azure.core.credentials import AzureKeyCredential
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
 def get_code_context(file_path, target_line, window=12):
     if not os.path.exists(file_path):
-        return f"[ERROR] Code context path missing on disk: {file_path}"
+        return f"[ERROR] Reference tracking workspace location missing on local drive disk asset: {file_path}"
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
@@ -27,33 +22,54 @@ def get_code_context(file_path, target_line, window=12):
             context_block.append(f"{marker} {line_num}: {lines[i].rstrip()}")
         return "\n".join(context_block)
     except Exception as e:
-        return f"[ERROR] Context extraction exception: {str(e)}"
-
-def run_local_rule_fallback(finding, code_context, idx):
-    v_type = finding.get("vulnerability_type", "Unknown") if isinstance(finding, dict) else "Unknown Vulnerability"
-    return {
-        "is_true_positive": True,
-        "vulnerability_type": v_type,
-        "cve_id": f"CVE-2026-LOCAL-{1000 + idx}",
-        "real_cvss_score": 7.5,
-        "real_cvss_severity": "HIGH",
-        "ai_taint_explanation": "Cloud validation bypassed. Structural data compiled safely via local fallback layer.",
-        "remediation_patch": "# Context validation fallback activated. Manual verification recommended."
-    }
+        return f"[ERROR] Context reading tracking failure exception: {str(e)}"
 
 def run_ai_triage():
-    report_path = "reports/security_report_pygoat_master.json"
-    output_path = "reports/ai_verified_report_pygoat_2.0.json"
+    # Set default fallback paths
+    sast_input = "reports/raw_sast_report.json"
+    iac_input = "reports/raw_iac_report.json"
+    output_database = "reports/ai_verified_report_sample.json"
     
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    if not os.path.exists(report_path):
-        print(f"[-] Base scanner report missing: '{report_path}'.")
-        return
+    # 🟢 CLI INTERCEPTOR: Maps exactly to arguments passed from the Orchestrator UI
+    if len(sys.argv) > 3:
+        sast_input = sys.argv[1]
+        iac_input = sys.argv[2]
+        output_database = sys.argv[3]
 
+    combined_findings = []
+
+    # Parse SAST entries
+    if os.path.exists(sast_input):
+        try:
+            with open(sast_input, "r", encoding="utf-8") as f:
+                sast_data = json.load(f)
+                if isinstance(sast_data, list):
+                    combined_findings.extend(sast_data)
+        except Exception as e:
+            print(f"[-] Failed parsing SAST staging log: {e}")
+
+    # Parse IaC entries
+    if os.path.exists(iac_input):
+        try:
+            with open(iac_input, "r", encoding="utf-8") as f:
+                iac_data = json.load(f)
+                if isinstance(iac_data, list):
+                    combined_findings.extend(iac_data)
+        except Exception as e:
+            print(f"[-] Failed parsing IaC staging log: {e}")
+
+    print(f"[*] Aggregated Engine Matrix: Loaded {len(combined_findings)} total issues for AI triage processing.")
+
+    if not combined_findings:
+        print("[-] No raw vulnerabilities found across staging registers.")
+        os.makedirs(os.path.dirname(output_database), exist_ok=True)
+        with open(output_database, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        return
+        
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
-        print("[-] ERROR: GITHUB_TOKEN environment variable is not set. Cannot access Cloud AI Engine.")
+        print("[-] ERROR: GITHUB_TOKEN environment variable is not set.")
         return
         
     client = ChatCompletionsClient(
@@ -61,147 +77,93 @@ def run_ai_triage():
         credential=AzureKeyCredential(token)
     )
     
-    with open(report_path, "r", encoding="utf-8") as f:
-        raw_findings = json.load(f)
-        
     ai_verified_findings = []
-    processed_keys = set()
-    
-    if os.path.exists(output_path):
-        try:
-            with open(output_path, "r", encoding="utf-8") as cache_file:
-                ai_verified_findings = json.load(cache_file)
-                for item in ai_verified_findings:
-                    if isinstance(item, dict) and "ai_taint_explanation" in item:
-                        processed_keys.add(f"{item.get('file_name')}:{item.get('line_number')}")
-            print(f"[*] Resuming pipeline. Found {len(processed_keys)} already triaged entries.")
-        except Exception:
-            ai_verified_findings = []
+    print(f"[*] Phase 2 Threat Intelligence Mapping Active. Processing {len(combined_findings)} issues...")
 
-    print(f"[*] Phase 2 Cloud AI Active. Processing {len(raw_findings)} total entries...")
-
-    for idx, finding in enumerate(raw_findings, 1):
+    for idx, finding in enumerate(combined_findings, 1):
         if isinstance(finding, str):
-            finding = {
-                "file_name": "samples/app.py",
-                "line_number": 1,
-                "suspicious_code": finding,
-                "vulnerability_type": "Raw Code Diagnostic Entry"
-            }
+            continue
             
         file_name = finding.get("file_name", "")
         line_num = finding.get("line_number", 0)
         suspicious_code = finding.get("suspicious_code", "")
         vulnerability_type = finding.get("vulnerability_type", "Unknown")
         
-        current_key = f"{file_name}:{line_num}"
-        if current_key in processed_keys:
-            continue
-            
-        # LIVE CONSOLE FEEDBACK COUNTER
-        print(f"    --> [{idx}/{len(raw_findings)}] Analyzing: {os.path.basename(file_name)} (Line {line_num})...", end="", flush=True)
-        
+        print(f"    --> [{idx}/{len(combined_findings)}] Analyzing Threat Matrix: {os.path.basename(file_name)} (Line {line_num})...", end="", flush=True)
         start_time = time.time()
 
-        # Pacing throttle to handle strict GitHub token RPM limits
         if idx > 1:
             time.sleep(1.5)
 
         code_context = get_code_context(file_name, line_num)
         
-        prompt = f"""
-        You are an advanced enterprise AppSec Triage and Threat Intelligence Engine. 
-        Review this code execution context harvested by a Static Analysis tool:
-        
-        File Path: {file_name}
-        Line Number Flagged: {line_num}
-        Initial Scanner Category: {vulnerability_type}
-        Flagged Code Line: {suspicious_code}
-        
-        Surrounding Source Code Window:
-        {code_context}
-        
-        Your Mission:
-        1. Evaluate if this code is a True Positive or False Positive.
-        2. Perform a Threat Intelligence lookup to find its real CVE, or assign 'CVE-2026-MOCK-{(1000 + idx)}'.
-        3. Calculate CVSS base score (0.0 to 10.0) and severity.
-        
-        Return ONLY a raw JSON object matching the schema below. Do not wrap it in markdown block backticks or summary text:
-        {{
-            "is_true_positive": true,
-            "vulnerability_type": "Vulnerability Name",
-            "cve_id": "CVE-XXXX-XXXX",
-            "real_cvss_score": 8.5,
-            "real_cvss_severity": "HIGH",
-            "ai_taint_explanation": "Detailed explanation here.",
-            "remediation_patch": "Fix code line here."
-        }}
-        """
-        
-        retry_count = 0
-        max_retries = 2
-        success = False
-        
-        while retry_count <= max_retries:
-            try:
-                response = client.complete(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="gpt-4o-mini",  
-                    temperature=0.1,
-                    timeout=10  # FORCE CONNECTION SNAP IF API HANGS AT THE LIMIT
-                )
-                
-                raw_text = response.choices[0].message.content.strip()
-                
-                if "```" in raw_text:
-                    raw_text = raw_text.split("```")[1]
-                    if raw_text.startswith("json"):
-                        raw_text = raw_text[4:].strip()
-                raw_text = raw_text.strip("`").strip()
-                    
-                ai_verdict = json.loads(raw_text)
-                
-                if not ai_verdict.get("is_true_positive", True):
-                    ai_verdict["real_cvss_score"] = 0.0
-                    ai_verdict["real_cvss_severity"] = "NONE"
-                    ai_verdict["cve_id"] = "N/A"
+        # 🟢 UPDATED PROMPT: Strict architectural mandates forcing structural line formatting
+        prompt_template = """
+You are an advanced enterprise AppSec Triage, Threat Intelligence, and Cloud IaC Compliance Engine.
+Your core priority is to act as an objective filter that separates genuine security threats from harmless static analysis noise.
 
-                ai_verified_findings.append({**finding, **ai_verdict})
-                success = True
-                break
-                
-            except json.JSONDecodeError:
-                retry_count += 1
-                print(f"\n        [!] JSON translation anomaly on item {idx}. Retrying ({retry_count}/{max_retries})...")
-                time.sleep(1.0)
-                
-            except Exception as e:
-                error_str = str(e).lower()
-                # Catch actual network rate exhaustions explicitly
-                if "429" in error_str or "quota" in error_str or "rate limit" in error_str:
-                    print(f"\n    [🚫 API LIMIT HIT] Cloud Token quota exhausted on item {idx}.")
-                    print("    [*] Gracefully saving current progress data to disk ledger...")
-                    with open(output_path, "w", encoding="utf-8") as out_file:
-                        json.dump(ai_verified_findings, out_file, indent=4)
-                    return
-                
-                retry_count += 1
-                print(f"\n        [!] Connection handshake timeout/issue on item {idx}. Retrying ({retry_count}/{max_retries})...")
-                time.sleep(2.0 * retry_count)
-                
-        if not success:
-            print(" [LOCAL FALLBACK]")
-            local_verdict = run_local_rule_fallback(finding, code_context, idx)
-            ai_verified_findings.append({**finding, **local_verdict})
-        else:
-            elapsed = time.time() - start_time
-            print(f" [DONE in {elapsed:.1f}s]")
+Review this flaw harvested from static analysis:
+- File Target: {file_name}
+- Line Number Flagged: {line_num}
+- Scanner Category Identifier: {vulnerability_type}
+- Flagged Source Snippet: {suspicious_code}
 
-        # Incremental backup write on every item loop complete
-        with open(output_path, "w", encoding="utf-8") as out_file:
-            json.dump(ai_verified_findings, out_file, indent=4)
+CRITICAL DATA - Surrounding Context Code Window (+/- 12 lines):
+{code_context}
 
-    print(f"\n[SUCCESS] Phase 2 Triage Complete! Dataset fully updated at: '{output_path}'")
+YOUR REMEDIATION FORMATTING MANDATES:
+1. The "remediation_patch" value MUST be perfectly valid Python execution blocks.
+2. NEVER cram independent execution statements onto a single line separated by spaces. If you assign a variable and execute a query, they MUST be separated by an actual physical newline character context.
+3. For SQL Injection fixes, use standard parameterization syntax arrays. Do NOT use string interpolation formats like `% (user_id,)`.
+4. Ensure you do not emit structural escape characters like raw text '\\n' text blocks; use actual multiline formatting blocks inside your JSON assignment string value payload definitions.
+
+Return ONLY a raw JSON object matching this schema template profile. Do not wrap it in markdown code blocks or backticks:
+{{
+    "is_true_positive": true,
+    "vulnerability_type": "Official Security Flaw Industry Name, CWE Category, or Compliance Violation ID",
+    "cve_id": "CWE-250",
+    "real_cvss_score": 7.5,
+    "real_cvss_severity": "HIGH",
+    "ai_taint_explanation": "Provide a detailed justification of why this code context window represents an active configuration vulnerability or real code-level flaw.",
+    "remediation_patch": "query = 'SELECT * FROM users WHERE id = %s'\\ncursor.execute(query, (user_id,))"
+}}
+"""
+
+        prompt = prompt_template.format(
+            file_name=file_name,
+            line_num=line_num,
+            vulnerability_type=vulnerability_type,
+            suspicious_code=suspicious_code,
+            code_context=code_context
+        )
+        
+        try:
+            response = client.complete(
+                messages=[{"role": "user", "content": prompt}],
+                model="gpt-4o-mini",  
+                temperature=0.1,
+                timeout=15
+            )
+            
+            raw_text = response.choices[0].message.content.strip()
+            if "```" in raw_text:
+                raw_text = raw_text.split("```")[1]
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:].strip()
+            raw_text = raw_text.strip("`").strip()
+            
+            ai_verdict = json.loads(raw_text)
+            ai_verified_findings.append({**finding, **ai_verdict})
+            print(f" [DONE in {time.time() - start_time:.1f}s -> Mapped to: {ai_verdict.get('cve_id')}]")
+            
+        except Exception as e:
+            print(f" [SKIPPED - Error: {e}]")
+            continue
+
+    os.makedirs(os.path.dirname(output_database), exist_ok=True)
+    with open(output_database, "w", encoding="utf-8") as out_file:
+        json.dump(ai_verified_findings, out_file, indent=4)
+    print(f"\n[SUCCESS] Pipeline Complete! Ledger stored at: '{output_database}'")
 
 if __name__ == "__main__":
     run_ai_triage()
